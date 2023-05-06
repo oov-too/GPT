@@ -1,0 +1,570 @@
+
+# TREND_ANALYZER.PY
+# updated inclusive HACD
+# mask tensor implemented
+
+#region imports
+from AlgorithmImports import *
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from functions import MLGetHistory, checkNan
+#endregion
+
+
+class TrendAnalyzer:
+    def __init__(self, symbol, time_frame):
+        self.symbol = symbol.Symbol
+        self.udl = symbol
+        self.time_frame = time_frame
+        self.TList = []
+        self.final_df = pd.DataFrame()
+        self.QB = QuantBook()
+        # print(f'NEW TRENDANALYZER: no duplicate columns')
+
+    def GetNumberOfTradeBarsInInterval(self, exchangeHours, start, end, barSize):
+        if (barSize <= timedelta()):
+            print(f'{self.Time}  GNOTBII ERROR BARSIZE INVALID: {barSize}')
+
+        count = 0
+        current = start
+        oneDay = timedelta(days=1)
+
+        if barSize == oneDay:
+            while current < end:
+                if exchangeHours.IsDateOpen(current):
+                    count += 1
+                current = current + oneDay
+            return count
+
+        while current < end:
+            previous = current
+            current = current + barSize
+            if exchangeHours.IsOpen(previous, current):
+                count += 1
+        
+        return count
+
+    def add_trendlines_to_df(self, df, timescale_prefix, threshold, stored_dictionaries):
+        print(f'ADDING {timescale_prefix}TRENDLINES...')
+        i = 1
+        n = 365
+        day1 = self.QB.Time.date()
+        while i < n:
+            trading_day = self.QB.TradingCalendar.GetTradingDay(day1)
+            if trading_day:
+                break
+            else: 
+                i += 1
+                day1 = day1 + timedelta(days=1)
+        exchangeHours = self.udl.Exchange.Hours
+        start = exchangeHours.GetPreviousMarketOpen(day1, True)
+        end = exchangeHours.GetNextMarketClose(start, True)
+        
+        # Create a list of DataFrames for each trendline
+        trendline_dfs = []
+        trendline_cols = []
+        final_df = []
+        
+        # Iterate over all stored dictionaries
+        for dictionary in stored_dictionaries:
+            # Get the timescale prefix and create column name prefix
+            if timescale_prefix == dictionary['timescale'] + '_':
+                col_name_prefix = f'{timescale_prefix}Trendline_'
+                self.TList = dictionary['TList']
+                
+                # Create a column for each trend line in the trendline_df
+                for trend in self.TList:
+                    # Calculate the trendline for this trend
+                    constant = trend[6]
+                    bars_in_timescale = self.GetNumberOfTradeBarsInInterval(exchangeHours, start, end, dictionary['timedelta'])
+                    prediction = trend[8]
+                    trendline = np.array([constant * i * bars_in_timescale + prediction for i in range(df.shape[0])])
+
+                    # Create a single column DataFrame for this trendline
+                    col_name = f'{col_name_prefix}{trend[1]}_{constant}'
+                    
+                    # Check if col_name already added
+                    if col_name in trendline_cols:
+                        continue
+                    
+                    trendline_col = pd.DataFrame(trendline, index=df.index, columns=[col_name])
+                    
+                    # Fill in missing data points using linear interpolation
+                    trendline_col = trendline_col.interpolate(method='time')
+                    # print(f'Added column: {col_name}, DataFrame shape: {trendline_col.shape}')
+
+                    # Add this trendline DataFrame to the list of DataFrames
+                    trendline_dfs.append(trendline_col)
+                    trendline_cols.append(col_name)
+                
+            # Concatenate all the trendline DataFrames together
+            final_df = pd.concat([df] + trendline_dfs, axis=1)
+        
+        if final_df.empty:
+            print(f'FINAL DF ERROR: NO DF')
+        return final_df
+
+    def prepare_concatenated_dataframes(stored_dictionaries, history, symbol):
+        df_list = []
+        for dictionary in stored_dictionaries:
+            timescale = dictionary['timescale']
+            hist_data = MLGetHistory(dictionary, symbol, timescale, history)
+            df_list.append(hist_data)
+
+        df_concat_list = []
+        final_df_list = []
+        for index, df in enumerate(df_list):
+            timescale = stored_dictionaries[index]['timescale']
+            
+            if index == 0:
+                df_concat_list.append(df)
+                one_min_df = df
+            elif 0 < index < len(df_list):
+                df = df.resample('1min').ffill(limit=None)
+                df = df.reindex(one_min_df.index)
+                df.fillna(method='ffill', inplace=True)  # Replace interpolation with forward-fill
+            elif index == len(df_list):
+                df = df.resample('1d').ffill(limit=None)
+                df = df.reindex(one_min_df.index)
+                df.fillna(method='ffill', inplace=True)  # Replace interpolation with forward-fill
+            df_concat_list.append(df)
+
+        for index, df in enumerate(df_concat_list):    
+            # Merge the target column and target features
+            if index != 1:
+                target_df = df_list[1]  # Assuming M_ is the 1st item in df_list
+                df = df.merge(target_df[['V_low']], left_index=True, right_index=True, suffixes=('', '_y'))
+                columns = df.columns.tolist()
+                if 'V_low_y' in columns:
+                    df.drop(columns=['V_low_y'], inplace=True)
+                    print(f'DUPLICATE TARGET COLUMN REMOVED. LIST POSITION: {index}')
+                final_df_list.append(df)
+            
+        return final_df_list
+
+class GRUModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(GRUModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, mask):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+        out, _ = self.gru(x, h0)
+        out = out * mask.unsqueeze(-1)  # Apply the mask
+        out = self.fc(out[:, -1, :])
+        return out
+
+
+
+'''class GRUModel(nn.Module): # GRU for OGT Trend Analysis
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(GRUModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+        out, _ = self.gru(x, h0)
+        out = self.fc(out[:, -1, :])
+        return out'''
+
+
+
+
+# FUNCTIONS.PY
+# updated inclusive HACD
+# save function for HACD
+# mask tensor implemented
+
+#region imports
+from AlgorithmImports import *
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from QuantConnect.Data.Market import TradeBar
+
+import io
+import math
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import pickle
+#endregion
+
+def HACDP(dictionary, price, time):
+    
+    def TotalDif(previous, hacd):
+        if np.isnan(previous):
+            if np.isnan(hacd):
+                return 0
+            else:
+                return hacd
+        elif np.isnan(hacd):
+            return previous
+        else:
+            return previous + hacd
+
+    timescale = dictionary['timescale']
+    fast_ma = dictionary['HACD']['Hull']
+    slow_ma = dictionary['HACD']['ALMA']
+
+    if fast_ma.IsReady and slow_ma.IsReady:
+        
+        fast_ma = fast_ma.Current.Value
+        slow_ma = slow_ma.Current.Value
+        hacdp = ((fast_ma - slow_ma) / price)
+
+        # Debugging NaN values
+        if np.isnan(hacdp):
+            print(f"NaN value found for HACD at time: {time}, fast_ma: {fast_ma}, slow_ma: {slow_ma}, price: {price}")
+
+        for period in dictionary['HACD']['SMAs']:
+            dictionary['HACD']['SMAs'][period].Update(time, hacdp)
+
+        previous = dictionary['HACD']['TotalDif']
+        dictionary['HACD']['TotalDif'] = TotalDif(previous, hacdp)
+
+        for period in dictionary['HACD']['TDSMAs']:
+            dictionary['HACD']['TDSMAs'][period].Update(time, dictionary['HACD']['TotalDif'])
+
+        # Create a dictionary to store the HACD, SMAs, and TDSMAs values
+        hacd_data = {'HACD': hacdp}
+        # Accessing and updating SMAs
+        for period, SMA in dictionary['HACD']['SMAs'].items():
+            if SMA.IsReady:
+                hacd_data[f'SMA_{period}'] = SMA.Current.Value
+            else:
+                hacd_data[f'SMA_{period}'] = -1e9
+
+        # Access and update TDSMAs
+        for period, TDSMA in dictionary['HACD']['TDSMAs'].items():
+            if TDSMA.IsReady:
+                hacd_data[f'TDSMA_{period}'] = TDSMA.Current.Value
+            else:
+                hacd_data[f'TDSMA_{period}'] = -1e9
+
+        # Check for NaN values in hacd_data
+        nan_keys = [key for key, value in hacd_data.items() if np.isnan(value)]
+        if nan_keys:
+            print(f"NaN value found in hacd_data at time: {time} for key(s): {nan_keys}")
+
+        return time, hacd_data
+
+    else:
+        hacdp = -1e9
+        hacd_data = {'HACD': hacdp}
+        # Accessing and updating SMAs
+        for period, SMA in dictionary['HACD']['SMAs'].items():
+            hacd_data[f'SMA_{period}'] = -1e9
+        # Access and update TDSMAs
+        for period, TDSMA in dictionary['HACD']['TDSMAs'].items():
+            hacd_data[f'TDSMA_{period}'] = -1e9
+
+    return time, hacd_data
+
+def MLGetHistory(dictionary, symbol, timescale, history):
+
+    def process_history(dictionary, timescale, history, timedelta_value):
+        trade_bars = []
+        for time, bar in history.iterrows():
+            time = time - timedelta_value
+            tradeBar = TradeBar(time, symbol, bar.open, bar.high, bar.low, bar.close, bar.volume, timedelta_value)
+            trade_bars.append(tradeBar) 
+
+        trade_bars_dict = []
+        for trade_bar in trade_bars:
+            trade_bar_dict = {
+                'time': trade_bar.Time,
+                'symbol': trade_bar.Symbol,
+                f'{timescale}_open': trade_bar.Open,
+                f'{timescale}_high': trade_bar.High,
+                f'{timescale}_low': trade_bar.Low,
+                f'{timescale}_close': trade_bar.Close,
+                f'{timescale}_volume': trade_bar.Volume,
+                f'{timescale}_period': trade_bar.Period
+            }
+            trade_bars_dict.append(trade_bar_dict)
+
+        column_names = ['time'] + [k for k in trade_bars_dict[0].keys() if k not in ['time', 'symbol']]
+        df = pd.DataFrame(trade_bars_dict, columns=column_names)
+        df.set_index('time', inplace=True)
+
+        # Initialize empty lists to store datetime and HACD values
+        datetime_list = []
+        hacd_data_list = []
+
+        # Iterate over the rows in the history DataFrame
+        for time, row in df.iterrows():
+            price = row[f'{timescale}_close']
+        
+            fast_ma = dictionary['HACD']['Hull']
+            slow_ma = dictionary['HACD']['ALMA']
+
+            fast_ma.Update(time, price)
+            slow_ma.Update(time, price)
+
+            # Calculate HACD values using the HACDP() method
+            datetime, hacd_data = HACDP(dictionary, price, time)
+            if datetime is not None:
+                datetime_list.append(datetime)
+                hacd_data_list.append(hacd_data)
+
+        # Create a new DataFrame with datetime as the index and HACD, SMAs, and TDSMAs values
+        moving_average_periods = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181]
+        column_names = ['HACD'] + [f'SMA_{period}' for period in moving_average_periods] + [f'TDSMA_{period}' for period in moving_average_periods]
+        hacd_df = pd.DataFrame(hacd_data_list, columns=column_names)
+        hacd_df.index = pd.to_datetime(datetime_list)
+
+
+        # Concatenate the history DataFrame with the HACD DataFrame
+        combined_df = pd.concat([df, hacd_df], axis=1)
+
+        return combined_df
+
+    print(f'LOAD: V_Low_Model_postMseMaeError [DEBUGGING FEATURE / SCALER MISMATCH 4]')
+
+    if timescale == f'M':
+        return process_history(dictionary, timescale, history, timedelta(minutes=1))
+
+    if timescale == f'V':
+        return process_history(dictionary, timescale, history, timedelta(minutes=5))
+
+    if timescale == f'XV':
+        return process_history(dictionary, timescale, history, timedelta(minutes=15))
+
+    if timescale == f'XXX':
+        return process_history(dictionary, timescale, history, timedelta(minutes=30))
+
+    if timescale == f'D':
+        return process_history(dictionary, timescale, history, timedelta(days=1))
+
+def checkNan(df, timescale):
+    count = 0
+    nan_df = df.isna()
+    nan_columns = nan_df.any()
+    nan_rows = nan_df.any(axis=1)
+    if nan_rows.any():
+        count += 1
+        for column in df.columns:
+            if nan_columns[column].any():
+                print(f"  Column '{column}' contains NaN values: {df[nan_rows]}")
+    if count == 0:
+        print('No NaN values found in any DataFrame') 
+        return True
+    else:
+        return False
+
+def checkNanTB(trade_bars, trade_bar_dicts):
+    # debugging NaN
+    # Check if the list contains any NaN values
+    nan_trade_bars = []
+    for trade_bar in trade_bars:
+        nan_values = {
+            'open': math.isnan(trade_bar.Open),
+            'high': math.isnan(trade_bar.High),
+            'low': math.isnan(trade_bar.Low),
+            'close': math.isnan(trade_bar.Close),
+            'volume': math.isnan(trade_bar.Volume)
+        }
+        nan_attributes = [attr for attr, is_nan in nan_values.items() if is_nan]
+        if nan_attributes:
+            nan_trade_bars.append({'time': trade_bar.Time, 'nan_attributes': nan_attributes})
+    print("TradeBars with NaN values:")
+    count = 0
+    for nan_trade_bar in nan_trade_bars:
+        print(f"{nan_trade_bar['time']}: {nan_trade_bar['nan_attributes']}")
+        count += 1
+    if count == 0:
+        print('NONE')
+    # Check if the dictionaries contain any NaN values
+    nan_trade_bar_dicts = []
+    for trade_bar_dict in trade_bar_dicts:
+        nan_values = {
+            key: math.isnan(value) for key, value in trade_bar_dict.items() if key not in ['time', 'symbol', 'period']
+        }
+        nan_attributes = [attr for attr, is_nan in nan_values.items() if is_nan]
+        if nan_attributes:
+            nan_trade_bar_dicts.append({'time': trade_bar_dict['time'], 'nan_attributes': nan_attributes})
+    print("Dictionaries with NaN values:")
+    count2 = 0
+    for nan_trade_bar_dict in nan_trade_bar_dicts:
+        print(f"{nan_trade_bar_dict['time']}: {nan_trade_bar_dict['nan_attributes']}")
+        count2 += 1
+    if count2 == 0:
+        print('NONE')
+
+def checkIndices(df_list):
+    base_index = df_list[0].index
+    matching_indices = [True] * len(df_list)
+    
+    for i, df in enumerate(df_list[1:], start=1):
+        if not base_index.equals(df.index):
+            matching_indices[i] = False
+
+    if all(matching_indices):
+        print("All DataFrame indices match.")
+    else:
+        print("Indices of the DataFrames do not match.")
+        for i, match in enumerate(matching_indices):
+            if not match:
+                print(f"DataFrame {i} index does not match base index.")
+            else:
+                print(f"DataFrame {i} index matches base index.")
+
+def save_training_data(qb, input_dataframe, features_data, scaler, timescale, name):
+    training_data = {
+        'input_dataframe': input_dataframe,
+        'features_data': features_data,
+        'scaler': scaler,
+        'scaler_feature_names': input_dataframe.columns
+    }
+
+    save(qb, training_data, timescale, name)
+
+def save(qb, file, timescale, name):
+    ProjectID = '14122444'
+    serialized = pickle.dumps(file)
+    
+    if timescale:
+        key = f'{ProjectID}_{timescale}{name}'
+    else:
+        key = f'{ProjectID}_{name}'
+    
+    qb.ObjectStore.SaveBytes(key, serialized)
+    print(f'{qb.Time}  SAVED: {key}')
+    return key
+
+def train_timescale_model(qb, df, timescale, GRUModel):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ProjectID = '14122444'
+    print(f'TRAINING {timescale}_HACD MODEL...') 
+   
+    # Select the columns you want to use as features
+    feature_columns = [col for col in df.columns if 'period' not in col]
+    features_data = df[feature_columns].values.astype(np.float32)
+    feature_count = len(feature_columns)
+    print(f'{feature_count} {timescale}FEATURES SELECTED...') 
+    print(feature_columns)
+
+    # Normalize the data
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    features_data_normalized = scaler.fit_transform(features_data)
+
+    # Create the mask tensor
+    train_ratio = 0.8
+    seq_length = 60
+
+    large_negative_number = -1e9
+    mask = (features_data_normalized != large_negative_number).any(axis=-1).astype(np.float32)
+    mask_sequences = []
+    for i in range(len(mask) - seq_length - 1):
+        mask_seq = mask[i:i + seq_length]
+        mask_sequences.append(mask_seq)
+    mask_sequences = np.stack(mask_sequences)
+
+    # Extract y_train (the target variable) from features_data
+    y_train = features_data[:, feature_columns.index('V_low')]
+
+    # Scale the target variable
+    target_scaler = MinMaxScaler()
+    y_train = target_scaler.fit_transform(y_train.reshape(-1, 1))
+
+    save_training_data(qb, df[feature_columns], features_data_normalized, scaler, timescale, '_training_data')
+
+    return {
+    'model': None,
+    'scaler': None,
+    'performance_metrics': None,
+    'test_losses': None
+}
+
+
+
+
+# ML HACD RESEARCH NOTEBOOK
+# Ready: V_low
+# https://www.quantconnect.com/docs/v2/research-environment/machine-learning/pytorch#01-Introduction
+
+%load_ext autoreload
+%reload_ext autoreload
+%autoreload 2
+
+import gc
+import os
+import sys
+import QuantConnect
+cwd = os.getcwd()
+functions_path = os.path.abspath(os.path.join(cwd, 'Research_Journals'))
+sys.path.append(functions_path)
+from functions import MLGetHistory, checkIndices, train_timescale_model, save, checkNan
+from Trend_Analyzer import TrendAnalyzer, GRUModel
+import pickle
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+self = QuantBook()
+self.ProjectID = 14122444
+
+self.udl = self.AddEquity('SPY', Resolution.Minute, Market.USA, True, 1, True)
+self.udl.SetDataNormalizationMode(DataNormalizationMode.Raw)
+symbol = self.udl.Symbol
+
+def initialize_indicators(dictionary):
+    moving_average_periods = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181]
+    
+    # Create new instances of the indicators
+    Hull = HullMovingAverage(9)
+    ALMA = ArnaudLegouxMovingAverage(9)
+    SMAs = {period: SimpleMovingAverage(period) for period in moving_average_periods}
+    TDSMAs = {period: SimpleMovingAverage(period) for period in moving_average_periods}
+    TotalDif = 0
+
+    # Update the dictionary with the new instances
+    dictionary['HACD']['Hull'] = Hull
+    dictionary['HACD']['ALMA'] = ALMA
+    dictionary['HACD']['SMAs'] = SMAs
+    dictionary['HACD']['TDSMAs'] = TDSMAs
+    dictionary['HACD']['TotalDif'] = TotalDif
+
+key = f'{self.ProjectID}_DictionaryList'
+
+if self.ObjectStore.ContainsKey(key):
+    deserialized = bytes(self.ObjectStore.ReadBytes(key))
+    storedDictionaries = (pickle.loads(deserialized)) 
+    for dictionary in storedDictionaries:
+        initialize_indicators(dictionary)
+    bar_count = timedelta(days=100)
+    res = Resolution.Minute
+    history = self.History(symbol, bar_count, res).loc[symbol]
+    df_concat_list = TrendAnalyzer.prepare_concatenated_dataframes(storedDictionaries, history, symbol)
+    
+    checkIndices(df_concat_list)
+
+    HACD_models = {}
+
+    timescales = ['M_', 'V_', 'XV_', 'XXX_', 'D_']
+    for index, df in enumerate(df_concat_list):
+        timescale = timescales[index]
+        # Train the GRU model for the current timescale
+        print(f'Training model for {timescale}HACD')
+        check = checkNan(df, timescale)
+        if check:
+            HACD_models[timescale] = train_timescale_model(self, df, timescale, GRUModel)
+        else:
+            self.Quit()
+    
+    print(f'// COMPLETE //')
